@@ -162,12 +162,6 @@ class FeatureBuilder:
 
     
     def row_pchip(self, row: int, col: int, skip_self: bool) -> float:
-        def clip_row_pred(pred: float) -> float:
-            if not np.isfinite(pred):
-                return pred
-            lo = float(np.min(y)) - 0.02
-            hi = float(np.max(y)) + 0.02
-            return float(np.clip(pred, lo, hi))
         x_values = self.surface.log_m[row, :][self.surface.known_mask[row, :]]
         y_values = self.surface.matrix[row, :][self.surface.known_mask[row, :]]
         x_target = self.surface.log_m[row, col]
@@ -189,12 +183,12 @@ class FeatureBuilder:
         if x_target <= x[0] and len(x) >= 3:
     # fit quadratic through first 3 points
             coeffs = np.polyfit(x[:3], y[:3], 2)
-            return clip_row_pred(float(np.polyval(coeffs, x_target)))
+            return float(np.polyval(coeffs, x_target))
         if x_target >= x[-1] and len(x) >= 3:
             # fit quadratic through last 3 points
             coeffs = np.polyfit(x[-3:], y[-3:], 2)
-            return clip_row_pred(float(np.polyval(coeffs, x_target)))
-        return clip_row_pred(float(PchipInterpolator(x, y, extrapolate=False)(x_target)))     
+            return float(np.polyval(coeffs, x_target))
+        return float(PchipInterpolator(x, y, extrapolate=False)(x_target))     
     
 
     def col_pchip(self, row: int, col: int, skip_self: bool) -> tuple[float, float]:
