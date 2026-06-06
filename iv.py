@@ -743,9 +743,9 @@ def main(mode:str) -> None:
         comp = {}
         for type in ["CE", "PE"]:
             if type=="CE":
-                fraction = 0.625
+                fraction = 0.5
             else:
-                fraction = 0.675
+                fraction = 0.62
             surface = IVSurface("train.csv", type=type)
             suf[type] = surface
             comp[type] = fit_and_predict_missing(surface,type=type,fraction=fraction)
