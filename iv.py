@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
 import xgboost as xgb
-OPTION_RE = re.compile(r"(?P<strike>\d{5})(?P<type>CE|PE)$")
 from sklearn.preprocessing import StandardScaler
 from scipy.optimize import curve_fit, minimize
 import warnings
@@ -23,6 +22,7 @@ class IVSurface:
         self.matrix = self.raw[self.option_cols].to_numpy(float)
         self.known_mask = np.isfinite(self.matrix)
         self.missing_mask = ~self.known_mask
+        OPTION_RE = re.compile(r"(?P<strike>\d{5})(?P<type>CE|PE)$")
 
         strikes: list[int] = []
         for col in self.option_cols:
@@ -189,7 +189,76 @@ class FeatureBuilder:
             coeffs = np.polyfit(x[-3:], y[-3:], 2)
             return float(np.polyval(coeffs, x_target))
         return float(PchipInterpolator(x, y, extrapolate=False)(x_target))     
+    def _get_svi_params(self, row: int, exclude_col=None):
     
+        def svi_raw(k, a, b, rho, m, sigma):
+            return a + b * (rho * (k - m) + np.sqrt((k - m)**2 + sigma**2))
+
+        cache_key = (row, exclude_col)
+        if cache_key in self._svi_cache:
+            return self._svi_cache[cache_key]   # ← already fitted, skip curve_fit
+
+        x_values = self.surface.log_m[row, :][self.surface.known_mask[row, :]]
+        y_values = self.surface.matrix[row, :][self.surface.known_mask[row, :]]
+
+        if exclude_col is not None:
+            known_cols = np.where(self.surface.known_mask[row, :])[0]
+            mask = known_cols != exclude_col
+            x_values = x_values[mask]
+            y_values = y_values[mask]
+
+        if len(x_values) < 5:
+            self._svi_cache[cache_key] = None
+            return None
+
+        order = np.argsort(x_values)
+        x = x_values[order]
+        y = y_values[order]
+        x, unique_idx = np.unique(x, return_index=True)
+        y = y[unique_idx]
+
+        a0     = np.min(y)
+        b0     = 0.1
+        rho0   = -0.3
+        m0     = np.mean(x)
+        sigma0 = np.std(x) if np.std(x) > 0 else 0.1
+
+        p0 = [
+            np.clip(a0,     -1,     1    ),
+            np.clip(b0,      0.001, 2.0  ),
+            np.clip(rho0,   -0.999, 0.999),
+            np.clip(m0,     -2,     2    ),
+            np.clip(sigma0,  0.001, 2.0  ),
+        ]
+        bounds = (
+            [-1,    0.001,  -0.999,  -2,   0.001],
+            [ 1,    2.0,     0.999,   2,    2.0 ]
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                params, _ = curve_fit(
+                    svi_raw, x, y,
+                    p0=p0, bounds=bounds, maxfev=5000
+                )
+                self._svi_cache[cache_key] = (params, svi_raw)
+                return (params, svi_raw)
+            except RuntimeError:
+                self._svi_cache[cache_key] = None
+                return None
+
+
+    def row_svi(self, row: int, col: int, skip_self: bool) -> float:
+        exclude    = col if skip_self else None
+        result     = self._get_svi_params(row, exclude_col=exclude)
+        x_target   = self.surface.log_m[row, col]
+
+        if result is None:
+            return self.row_pchip(row, col, skip_self)   # fallback
+
+        params, svi_raw = result
+        return float(np.clip(svi_raw(x_target, *params), 1e-5, 5.0))
 
     def col_pchip(self, row: int, col: int, skip_self: bool) -> tuple[float, float]:
         row_values = self.train_matrix[row, :]
@@ -202,157 +271,7 @@ class FeatureBuilder:
             self.surface.time_index[row],
         )
         return col_pchip
-    def causal_extra_features(self, row: int, col: int, row_pchip: float, col_pchip: float, skip_self: bool) -> list[float]:
-        matrix = self.train_matrix
-
-        def finite_past(limit=None):
-            vals = []
-            idxs = []
-            for i in range(row - 1, -1, -1):
-                if np.isfinite(matrix[i, col]):
-                    idxs.append(i)
-                    vals.append(float(matrix[i, col]))
-                    if limit is not None and len(vals) == limit:
-                        break
-            return np.asarray(idxs[::-1], dtype=float), np.asarray(vals[::-1], dtype=float)
-
-        def safe_mean(a):
-            return float(np.mean(a)) if len(a) else np.nan
-
-        def safe_std(a):
-            return float(np.std(a)) if len(a) else np.nan
-
-        def poly_extrapolate(x, y, degree):
-            if len(x) < degree + 1:
-                return np.nan
-            try:
-                return float(np.polyval(np.polyfit(x, y, degree), self.surface.time_index[row]))
-            except np.linalg.LinAlgError:
-                return np.nan
-
-        def ewma(values, alpha):
-            if len(values) == 0:
-                return np.nan
-            acc = float(values[0])
-            for v in values[1:]:
-                acc = alpha * float(v) + (1.0 - alpha) * acc
-            return acc
-
-        extras = [
-            row_pchip - col_pchip,
-            abs(row_pchip - col_pchip),
-            0.75 * row_pchip + 0.25 * col_pchip,
-            0.60 * row_pchip + 0.40 * col_pchip,
-        ]
-
-        for window in [3, 5, 8, 12, 20]:
-            x, y = finite_past(limit=window)
-            extras.extend([
-                safe_mean(y),
-                safe_std(y),
-                float(np.min(y)) if len(y) else np.nan,
-                float(np.max(y)) if len(y) else np.nan,
-                poly_extrapolate(x, y, 1),
-                poly_extrapolate(x, y, 2),
-                float(y[-1] - y[-2]) if len(y) >= 2 else np.nan,
-            ])
-
-        _, all_y = finite_past(limit=None)
-        ewma_fast = ewma(all_y, 0.65)
-        ewma_med = ewma(all_y, 0.35)
-        ewma_slow = ewma(all_y, 0.15)
-
-        extras.extend([
-            ewma_fast,
-            ewma_med,
-            ewma_slow,
-            float(all_y[-1] - ewma_fast) if len(all_y) and np.isfinite(ewma_fast) else np.nan,
-            float(all_y[-1] - ewma_slow) if len(all_y) and np.isfinite(ewma_slow) else np.nan,
-        ])
-
-        def row_interp_at(r):
-            if r < 0:
-                return np.nan
-            row_values = matrix[r, :]
-            valid = np.isfinite(row_values)
-            if not valid.any():
-                return np.nan
-            return pchip_predict(
-                self.surface.log_m[r, valid],
-                row_values[valid],
-                self.surface.log_m[row, col],
-            )
-
-        prev_row = row_interp_at(row - 1)
-        prev2_row = row_interp_at(row - 2)
-        prev5_row = row_interp_at(row - 5)
-
-        extras.extend([
-            prev_row,
-            prev2_row,
-            prev5_row,
-            prev_row - prev2_row if np.isfinite(prev_row) and np.isfinite(prev2_row) else np.nan,
-            prev_row - prev5_row if np.isfinite(prev_row) and np.isfinite(prev5_row) else np.nan,
-        ])
-
-        for lag in [1, 2, 3, 5, 10]:
-            if row >= lag:
-                extras.append(float(np.log(self.surface.spot[row] / self.surface.spot[row - lag])))
-            else:
-                extras.append(np.nan)
-
-        if row >= 10:
-            returns = np.diff(np.log(self.surface.spot[row - 10 : row + 1]))
-            extras.extend([
-                float(np.std(returns)),
-                float(np.mean(returns)),
-            ])
-        else:
-            extras.extend([np.nan, np.nan])
-
-        row_values = matrix[row, :].copy()
-        if skip_self:
-            row_values[col] = np.nan
-
-        valid = np.isfinite(row_values)
-        x = self.surface.log_m[row, valid]
-        y = row_values[valid]
-        x_target = self.surface.log_m[row, col]
-
-        row_poly2 = np.nan
-        row_poly3 = np.nan
-        row_linear_near = np.nan
-        row_anchor_span = np.nan
-        row_anchor_center_dist = np.nan
-
-        try:
-            if len(x) >= 3:
-                row_poly2 = float(np.polyval(np.polyfit(x, y, 2), x_target))
-            if len(x) >= 4:
-                row_poly3 = float(np.polyval(np.polyfit(x, y, 3), x_target))
-        except np.linalg.LinAlgError:
-            pass
-
-        if len(x) >= 2:
-            order = np.argsort(np.abs(x - x_target))
-            x2 = x[order[:2]]
-            y2 = y[order[:2]]
-            if abs(x2[1] - x2[0]) > 1e-12:
-                slope = (y2[1] - y2[0]) / (x2[1] - x2[0])
-                row_linear_near = float(y2[0] + slope * (x_target - x2[0]))
-
-            row_anchor_span = float(np.max(x) - np.min(x))
-            row_anchor_center_dist = float(x_target - np.mean(x))
-
-        extras.extend([
-            row_poly2,
-            row_poly3,
-            row_linear_near,
-            row_anchor_span,
-            row_anchor_center_dist,
-        ])
-
-        return extras
+    
 
     def build(self, targets: np.ndarray, skip_self: bool) -> pd.DataFrame:
         rows: list[list[float]] = []
@@ -364,13 +283,6 @@ class FeatureBuilder:
                 row_values[col] = np.nan
             row_pchip =self.row_pchip(row, col, skip_self=skip_self)
             col_pchip = self.col_pchip(row, col, skip_self=skip_self)
-            causal_extras = self.causal_extra_features(
-                row=row,
-                col=col,
-                row_pchip=row_pchip,
-                col_pchip=col_pchip,
-                skip_self=skip_self,
-            )
             row_time_blend = 0.75 * row_pchip + 0.25 * col_pchip
             idw = self.idw_predict(row, col, skip_self=skip_self)
 
@@ -411,9 +323,53 @@ class FeatureBuilder:
             known_density    = n_known / self.train_matrix.shape[1]
             n_prev_known     = float(np.sum(np.isfinite(self.train_matrix[:row, col])))
             col_pchip_vs_prev = col_pchip - prev_iv
+            # find the strike closest to ATM (log_moneyness closest to 0)
+            atm_col = int(np.argmin(np.abs(self.surface.log_m[row, :])))
+            atm_iv = self.train_matrix[row, atm_col]
+            if np.isnan(atm_iv):
+                # fallback to row mean
+                atm_iv = row_mean
+            # how far is this strike's IV from ATM IV
+            iv_minus_atm = row_pchip - atm_iv
 
-            
+            # ratio version
+            iv_ratio_atm = row_pchip / atm_iv if atm_iv > 0 else 1.0
+            known_cols_arr = np.where(np.isfinite(row_values))[0]
+            known_ivs_arr  = row_values[known_cols_arr]
+            known_logm_arr = self.surface.log_m[row, known_cols_arr]
+
+            # left wing = most OTM put (lowest log_m)
+            # right wing = most OTM call (highest log_m)
+            otm_put_iv  = float(known_ivs_arr[np.argmin(known_logm_arr)])
+            otm_call_iv = float(known_ivs_arr[np.argmax(known_logm_arr)])
+
+            risk_reversal = otm_put_iv - otm_call_iv      # skew direction
+            butterfly     = (otm_put_iv + otm_call_iv) / 2 - atm_iv  # curvature
             x = self.surface.log_m[row, col]
+            if len(known_logm_arr) >= 2:
+                skew_slope = float(np.polyfit(known_logm_arr, known_ivs_arr, 1)[0])
+            else:
+                skew_slope = 0.0
+            if row > 0:
+                prev_known = np.where(np.isfinite(self.train_matrix[row-1, :]))[0]
+                if len(prev_known) >= 2:
+                    prev_ivs  = self.train_matrix[row-1, prev_known]
+                    prev_logm = self.surface.log_m[row-1, prev_known]
+                    prev_skew_slope = float(np.polyfit(prev_logm, prev_ivs, 1)[0])
+                    skew_slope_change = skew_slope - prev_skew_slope
+                else:
+                    skew_slope_change = 0.0
+            else:
+                skew_slope_change = 0.0
+            if len(known_logm_arr) >= 3:
+                coeffs = np.polyfit(known_logm_arr, known_ivs_arr, 2)
+                quad_coeff   = float(coeffs[0])  # curvature (positive = smile, negative = frown)
+                linear_coeff = float(coeffs[1])  # skew direction
+                quad_fitted  = float(np.polyval(coeffs, self.surface.log_m[row, col]))
+            else:
+                quad_coeff   = 0.0
+                linear_coeff = 0.0
+                quad_fitted  = row_pchip
             rows.append(
                 [
                     row_pchip,
@@ -464,7 +420,17 @@ class FeatureBuilder:
                     known_density,
                     n_prev_known,
                     col_pchip_vs_prev,
-                    *causal_extras
+                    # rows.append
+                    atm_iv,
+                    iv_minus_atm,
+                    iv_ratio_atm,
+                    risk_reversal,
+                    butterfly,
+                    skew_slope,
+                    skew_slope_change,
+                    quad_coeff,
+                    linear_coeff,
+                    quad_fitted,
                     
                 ]
             )
@@ -518,83 +484,41 @@ class FeatureBuilder:
             "known_density",
             "n_prev_known",
             "col_pchip_vs_prev",
+            # columns
+            "atm_iv",
+            "iv_minus_atm",
+            "iv_ratio_atm",
+            "risk_reversal",
+            "butterfly",
+            "skew_slope",
+            "skew_slope_change",
+            "quad_coeff",
+            "linear_coeff",
+            "quad_fitted",
             
         ]
-        columns.extend( [
-        "row_col_pchip_diff",
-        "row_col_pchip_absdiff",
-        "causal_time_blend_25",
-        "causal_time_blend_40",
+        
+        return pd.DataFrame(rows, columns=columns).fillna(-1.0)
+    def adaptive_blend_from_df(self, df: pd.DataFrame) -> np.ndarray:
+        pchip_val = df["row_pchip"].to_numpy()
+        svi_val   = df["row_svi"].to_numpy()
+        n_known   = df["n_known"].to_numpy()
+        is_interp = df["is_interpolation"].to_numpy().astype(bool)
 
-        "past_mean_3",
-        "past_std_3",
-        "past_min_3",
-        "past_max_3",
-        "past_linear_3",
-        "past_quad_3",
-        "past_last_diff_3",
+        w_pchip = np.full(len(df), 0.1)
+        w_svi   = np.full(len(df), 0.9)
 
-        "past_mean_5",
-        "past_std_5",
-        "past_min_5",
-        "past_max_5",
-        "past_linear_5",
-        "past_quad_5",
-        "past_last_diff_5",
+        few    = is_interp & (n_known < 5)
+        medium = is_interp & (n_known >= 5) & (n_known < 8)
+        many   = is_interp & (n_known >= 8)
 
-        "past_mean_8",
-        "past_std_8",
-        "past_min_8",
-        "past_max_8",
-        "past_linear_8",
-        "past_quad_8",
-        "past_last_diff_8",
+        w_pchip[few]    = 0.2;  w_svi[few]    = 0.8
+        w_pchip[medium] = 0.4;  w_svi[medium] = 0.6
+        w_pchip[many]   = 0.65; w_svi[many]   = 0.35
 
-        "past_mean_12",
-        "past_std_12",
-        "past_min_12",
-        "past_max_12",
-        "past_linear_12",
-        "past_quad_12",
-        "past_last_diff_12",
-
-        "past_mean_20",
-        "past_std_20",
-        "past_min_20",
-        "past_max_20",
-        "past_linear_20",
-        "past_quad_20",
-        "past_last_diff_20",
-
-        "past_ewma_fast",
-        "past_ewma_med",
-        "past_ewma_slow",
-        "last_minus_ewma_fast",
-        "last_minus_ewma_slow",
-
-        "prev_row_pchip_at_target",
-        "prev2_row_pchip_at_target",
-        "prev5_row_pchip_at_target",
-        "prev_row_trend",
-        "prev_row_vs_prev5",
-
-        "spot_ret_1",
-        "spot_ret_2",
-        "spot_ret_3",
-        "spot_ret_5",
-        "spot_ret_10",
-        "spot_rvol_10",
-        "spot_trend_10",
-
-        "row_poly2",
-        "row_poly3",
-        "row_linear_near",
-        "row_anchor_span",
-        "row_anchor_center_dist",
-    ]
-        )
-        return pd.DataFrame(rows, columns=columns).fillna(-999.0)
+        return w_pchip * pchip_val + w_svi * svi_val
     
+
 
 def fit_model(x_train: pd.DataFrame, y_train: np.ndarray, seed: int, type: str, learning_rate: float, min_child_weight: int, max_depth: int, n_estimators: int) -> xgb.XGBRegressor:
     if type == "CE":
@@ -662,16 +586,20 @@ def run_validation(surface: IVSurface, seed: int, type: str, learning_rate: floa
 
     print("Building train features...")
     builder = FeatureBuilder(surface, train_matrix)
-    builder._svi_cache = {}                          # ← init cache
     x_train = builder.build(train_targets, skip_self=True)
 
     print("Building validation features...")
-    builder._svi_cache = {}                          # ← reset cache for val
     x_valid = builder.build(valid_targets, skip_self=False)
-    residual_target = y_train - x_train["row_pchip"].to_numpy()  
+    residual_target = y_train - x_train["row_pchip"].to_numpy()  # ← blend baseline for train
 
     predictions = []
     seeds = [42, 7, 123, 999, 2024, 17, 256, 314, 88, 500]
+
+    if type=="CE":
+        fraction = 0.425
+    else:
+        fraction = 0.475
+
 
     for model_seed in tqdm(seeds, desc="Validation models"):
         model = fit_model(
@@ -683,7 +611,7 @@ def run_validation(surface: IVSurface, seed: int, type: str, learning_rate: floa
             n_estimators=n_estimators
         )
         predictions.append(
-            x_valid["row_pchip"].to_numpy() + model.predict(x_valid) * 0.675
+            x_valid["row_pchip"].to_numpy() + model.predict(x_valid) * fraction
         )
 
     prediction = np.maximum(np.mean(predictions, axis=0), 1e-5)
@@ -725,8 +653,8 @@ def fit_and_predict_missing(surface: IVSurface, type: str, fraction: float) -> N
     return completed
     
 
-def main(mode:str) -> None:
-    if (mode == "validate"):
+def main(mode: str) -> None:
+    if mode == "validate":
         for type in ["CE", "PE"]:
             surface = IVSurface("train.csv", type=type)
             results = []
@@ -738,14 +666,14 @@ def main(mode:str) -> None:
             avg_rmse = np.mean(results)
             std_rmse = np.std(results)
             print(f"rmse={avg_rmse:.8f} ± {std_rmse:.8f}")
-    else:  
+    else:
         suf = {}
         comp = {}
         for type in ["CE", "PE"]:
             if type=="CE":
-                fraction = 0.5
+                fraction = 0.625
             else:
-                fraction = 0.62
+                fraction = 0.675
             surface = IVSurface("train.csv", type=type)
             suf[type] = surface
             comp[type] = fit_and_predict_missing(surface,type=type,fraction=fraction)
@@ -754,7 +682,7 @@ def main(mode:str) -> None:
             for col_idx, col_name in enumerate(suf[type].option_cols):
                 df[col_name] = comp[type][:, col_idx]
 
-        df.to_csv("filled_surfacebackfc65c.csv", index=False)
-    
+        df.to_csv("filled_surfacebackfc2ff.csv", index=False)
+        
 if __name__ == "__main__":
     main(mode="predict")
