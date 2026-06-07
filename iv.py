@@ -508,9 +508,9 @@ def run_validation(surface: IVSurface, seed: int, type: str, learning_rate: floa
     seeds = [42, 7, 123, 999, 2024, 17, 256, 314, 88, 500]
 
     if type=="CE":
-        fraction = 0.425
+        fraction = 0.625
     else:
-        fraction = 0.475
+        fraction = 0.675
 
 
     for model_seed in tqdm(seeds, desc="Validation models"):
