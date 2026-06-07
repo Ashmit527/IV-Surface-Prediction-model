@@ -13,7 +13,7 @@ Options data in practice is always sparse — not every strike has a live quote 
 
 Separate models are trained for **Call (CE)** and **Put (PE)** options, since their IV surfaces exhibit structurally different behaviour.
 
-**Kaggle private leaderboard RMSE: `0.000046`**
+**Kaggle private leaderboard RMSE: `0.0000463419`**
 
 ---
 
