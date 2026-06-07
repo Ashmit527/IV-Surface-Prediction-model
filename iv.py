@@ -158,7 +158,7 @@ class FeatureBuilder:
         values = self.train_matrix[rows[order], cols[order]]
         weights = 1.0 / np.maximum(distances, 1e-6) ** 2
         return float(np.sum(weights * values) / np.sum(weights))
-    from scipy.optimize import curve_fit
+    
 
     
     def row_pchip(self, row: int, col: int, skip_self: bool) -> float:
