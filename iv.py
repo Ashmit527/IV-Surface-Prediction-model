@@ -4,9 +4,6 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
 import xgboost as xgb
-from sklearn.preprocessing import StandardScaler
-from scipy.optimize import curve_fit, minimize
-import warnings
 from tqdm import tqdm
 
 
@@ -135,18 +132,22 @@ class FeatureBuilder:
 
     def idw_predict(self, row: int, col: int, skip_self: bool) -> float:
         start = max(0, row - self.idw_window)
-        rows, cols = np.where(np.isfinite(self.train_matrix[start : row + 1, :]))
-        if len(rows) == 0:
-            return np.nan
-        rows = rows + start
+
+        past_rows, past_cols = np.where(np.isfinite(self.train_matrix[start:row, :]))
+        past_rows = past_rows + start
+
+    
+        cur_cols = np.where(np.isfinite(self.train_matrix[row, :]))[0]
+        cur_rows = np.full(len(cur_cols), row, dtype=int)
+
+        rows = np.concatenate([past_rows, cur_rows])
+        cols = np.concatenate([past_cols, cur_cols])
+
         if skip_self:
             keep = ~((rows == row) & (cols == col))
             rows = rows[keep]
             cols = cols[keep]
-        else:
-            keep = ~((rows == row) & (cols == col) & ~np.isfinite(self.train_matrix[row, col]))
-            rows = rows[keep]
-            cols = cols[keep]
+
         if len(rows) == 0:
             return np.nan
 
@@ -158,7 +159,6 @@ class FeatureBuilder:
         values = self.train_matrix[rows[order], cols[order]]
         weights = 1.0 / np.maximum(distances, 1e-6) ** 2
         return float(np.sum(weights * values) / np.sum(weights))
-    
 
     
     def row_pchip(self, row: int, col: int, skip_self: bool) -> float:
@@ -189,6 +189,7 @@ class FeatureBuilder:
             coeffs = np.polyfit(x[-3:], y[-3:], 2)
             return float(np.polyval(coeffs, x_target))
         return float(PchipInterpolator(x, y, extrapolate=False)(x_target))     
+    
 
     def col_pchip(self, row: int, col: int, skip_self: bool) -> tuple[float, float]:
         row_values = self.train_matrix[row, :]
@@ -429,26 +430,7 @@ class FeatureBuilder:
         ]
         
         return pd.DataFrame(rows, columns=columns).fillna(-1.0)
-    def adaptive_blend_from_df(self, df: pd.DataFrame) -> np.ndarray:
-        pchip_val = df["row_pchip"].to_numpy()
-        svi_val   = df["row_svi"].to_numpy()
-        n_known   = df["n_known"].to_numpy()
-        is_interp = df["is_interpolation"].to_numpy().astype(bool)
-
-        w_pchip = np.full(len(df), 0.1)
-        w_svi   = np.full(len(df), 0.9)
-
-        few    = is_interp & (n_known < 5)
-        medium = is_interp & (n_known >= 5) & (n_known < 8)
-        many   = is_interp & (n_known >= 8)
-
-        w_pchip[few]    = 0.2;  w_svi[few]    = 0.8
-        w_pchip[medium] = 0.4;  w_svi[medium] = 0.6
-        w_pchip[many]   = 0.65; w_svi[many]   = 0.35
-
-        return w_pchip * pchip_val + w_svi * svi_val
     
-
 
 def fit_model(x_train: pd.DataFrame, y_train: np.ndarray, seed: int, type: str, learning_rate: float, min_child_weight: int, max_depth: int, n_estimators: int) -> xgb.XGBRegressor:
     if type == "CE":
