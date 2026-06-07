@@ -1,4 +1,3 @@
-# IV-Surface-Prediction-model
 # Nifty50 IV Surface Completion
 
 A machine learning pipeline to predict and fill missing implied volatility values across the Nifty50 options surface, built for the **Finance Club Open Project**.
@@ -13,6 +12,8 @@ Options data in practice is always sparse — not every strike has a live quote 
 2. **XGBoost residual correction** — learns the systematic error of the PCHIP baseline from observed data points and corrects the prediction, without overfitting.
 
 Separate models are trained for **Call (CE)** and **Put (PE)** options, since their IV surfaces exhibit structurally different behaviour.
+
+**Kaggle private leaderboard RMSE: `0.000046`**
 
 ---
 
@@ -251,6 +252,45 @@ Install with:
 ```bash
 pip install numpy pandas scipy xgboost tqdm
 ```
+
+---
+
+## Approaches Tried Before Final Pipeline
+
+Several approaches were explored and discarded before arriving at the current PCHIP + XGBoost residual design.
+
+### RBF Interpolation
+
+Radial Basis Function interpolation was the first attempt. RBF operates in the full 2D `(log_moneyness, time)` space and fits a globally smooth surface through all known points. While it is mathematically elegant, it performed poorly on this dataset for a few reasons:
+
+- RBF assumes a globally uniform smoothness — it applies the same kernel bandwidth everywhere. The IV surface is not globally uniform: it is steep and noisy near expiry (low `tau`) and flatter far from expiry. RBF cannot adapt to this.
+- It does not encode any structure of the smile (symmetry around ATM, wing behaviour, skew direction). It just interpolates numbers in 2D without any financial intuition.
+- As the number of known points grows, RBF requires solving a dense linear system whose cost scales as O(n³), making it slow for large datasets.
+
+PCHIP respects the smile's local structure in the moneyness dimension and handles sparse data per row independently, which is a much better fit for this problem.
+
+### Neural Network to Predict PCHIP Coefficients
+
+The idea here was: instead of directly interpolating missing IV values, predict the PCHIP spline coefficients at missing points using a neural network trained on the known coefficients. The model would learn the temporal evolution of the spline shape.
+
+This turned out to be a fundamental misunderstanding of what interpolation does. PCHIP's job is precisely to enforce smoothness constraints — it guarantees monotonicity and continuity by construction. By asking a neural network to predict the coefficients, the approach was effectively bypassing the smoothness guarantee and replacing it with a learned approximation that had no such guarantee. The outputs were rough and physically unreasonable. The network was making the predictions worse, not better, because it was taking over the one thing interpolation already does correctly. The right role for a learned model is to correct the residuals after interpolation, not to replace the interpolation itself — which is exactly what the final design does.
+
+### SVI (Stochastic Volatility Inspired) Parametric Model
+
+SVI was implemented and tested as both a baseline and a fallback for PCHIP. The raw SVI parametrisation fits a 5-parameter model to the smile:
+
+```
+w(k) = a + b * (ρ(k − m) + √((k − m)² + σ²))
+```
+
+where `w` is total variance and `k = log(K/S)`. The appeal is that SVI respects the no-arbitrage structure of the smile and extrapolates wings more faithfully than PCHIP.
+
+In practice two problems prevented it from being included:
+
+- **Speed**: fitting SVI requires running `scipy.optimize.curve_fit` per row, which is a nonlinear least-squares solve. With thousands of rows and many iterations, this added significant runtime that made the pipeline impractical for the dataset size.
+- **Convergence failures**: for rows with few known points, sparse wing data, or noisy quotes near expiry, the SVI optimiser frequently failed to converge or returned degenerate parameters. Robust fallback logic mitigated this partially, but not enough to trust it across all rows.
+
+SVI is retained as a future upgrade rather than a current component — see the section below.
 
 ---
 
